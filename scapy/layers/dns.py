@@ -278,6 +278,24 @@ def dns_compress(pkt):
                 # possible pointer for future strings.
                 # We get the index of the encoded data
                 index = build_pkt.index(encoded)
+                # RFC 1035 section 4.1.4: a compression pointer is a 14-bit
+                # offset, so it can only target the first 16384 bytes
+                # (offsets 0..16383) of the message. When the first
+                # occurrence of this name lies beyond that limit, no valid
+                # pointer can be built for it. Instead of letting chb() raise
+                # a bare struct.error on the overflowing high byte (which
+                # used to crash the whole build), skip compression for this
+                # name and keep every occurrence in full label form. The
+                # name is simply not registered, so no pointer is ever
+                # emitted for it and the layout stays valid/unchanged here.
+                if index >= 0x4000:
+                    warning(
+                        "DNS compression: name %r first appears at offset "
+                        "%d (>= 16384), which cannot be encoded by a 14-bit "
+                        "RFC 1035 pointer; keeping it uncompressed",
+                        part, index,
+                    )
+                    continue
                 # The following is used to build correctly the pointer
                 fb_index = ((index >> 8) | 0xc0)
                 sb_index = index - (256 * (fb_index - 0xc0))

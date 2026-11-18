@@ -531,3 +531,80 @@ for i in pkt:
 b = b'\x00\x08\x00\x0c\x00\x02=\x00+\xaf\xa3\xc4\xed\xeeW\xb8'
 p = EDNS0ClientSubnet(b)
 assert p.source_plen == 61 and p.address == '2baf:a3c4:edee:57b8::'
+
+= DNS - dns_compress pointer offset above the 14-bit RFC 1035 limit
+~ dns
+
+# These packets hold hundreds of resource records, so the default
+# conf.max_list_count (100) would stop their dissection. Raise it for the
+# duration of the test and restore it afterwards so large frames can be
+# rebuilt and re-parsed.
+old_max_list_count = conf.max_list_count
+conf.max_list_count = 1000
+try:
+    target = b"edge.target.example."
+    target_encoded = b"\x04edge\x06target\x07example\x00"
+
+    def _build_large_dns(n):
+        # n filler A RRs whose names share no label with each other, so they
+        # never compress among themselves and their raw offsets are stable,
+        # followed by two RRs repeating the same target owner name.
+        rrs = [
+            DNSRR(rrname=("a%05d.b%05d." % (i, 99999 - i)).encode(),
+                  type="A", rdata="10.0.0.1", ttl=0)
+            for i in range(n)
+        ]
+        rrs.append(DNSRR(rrname=target, type="A", rdata="192.0.2.1", ttl=0))
+        rrs.append(DNSRR(rrname=target, type="A", rdata="192.0.2.2", ttl=0))
+        return DNS(qr=1, qd=[], an=rrs)
+
+    # Control case: the target name first appears below the 14-bit limit
+    # (offset < 0x4000) in a > 16 KiB packet. Compression must still happen
+    # and emit a valid pointer, keeping the existing semantics unchanged.
+    pkt_in = _build_large_dns(564)
+    assert len(raw(pkt_in)) > 0x4000
+    first_index_in = raw(pkt_in).index(target_encoded)
+    assert first_index_in < 0x4000
+    cmp_in = dns_compress(pkt_in)
+    out_in = raw(cmp_in)
+    # The repeated target name is replaced by a 2-byte pointer: frame shrinks.
+    assert len(out_in) < len(raw(pkt_in))
+    # A compression pointer's first byte has its two high bits set (>= 0xc0).
+    assert any(rr.rrname[:1] and rr.rrname[0] >= 0xc0 for rr in cmp_in.an)
+    # No pointer may reference an offset outside the 14-bit range.
+    assert all(
+        not (rr.rrname[:1] and rr.rrname[0] >= 0xc0) or
+        ((rr.rrname[0] & 0x3f) << 8 | rr.rrname[1]) < 0x4000
+        for rr in cmp_in.an
+    )
+    reparsed_in = DNS(out_in)
+    assert reparsed_in.an[-2].rrname == target
+    assert reparsed_in.an[-1].rrname == target
+
+    # Out-of-range case: the target name first appears at an offset that no
+    # 14-bit pointer can encode (>= 0x4000). dns_compress must not raise a
+    # bare struct.error nor emit an invalid pointer; it skips compression for
+    # that name and keeps every occurrence in full label form.
+    pkt_out = _build_large_dns(565)
+    first_index_out = raw(pkt_out).index(target_encoded)
+    assert first_index_out >= 0x4000
+    # Before the fix this raised: struct.error("'B' format requires ...").
+    cmp_out = dns_compress(pkt_out)
+    out_out = raw(cmp_out)
+    # No compression at all happened to this frame: it is the full build.
+    assert out_out == raw(pkt_out)
+    # The target name is present twice, both as full (non-pointer) labels.
+    assert out_out.count(target_encoded) == 2
+    # No owner name is encoded as a compression pointer.
+    assert not any(rr.rrname[:1] and rr.rrname[0] >= 0xc0
+                   for rr in cmp_out.an)
+    # Re-parsing yields the original names and data unchanged.
+    reparsed_out = DNS(out_out)
+    assert len(reparsed_out.an) == len(pkt_out.an)
+    assert reparsed_out.an[-2].rrname == target
+    assert reparsed_out.an[-1].rrname == target
+    assert reparsed_out.an[-2].rdata == "192.0.2.1"
+    assert reparsed_out.an[-1].rdata == "192.0.2.2"
+    assert raw(reparsed_out) == raw(pkt_out)
+finally:
+    conf.max_list_count = old_max_list_count
